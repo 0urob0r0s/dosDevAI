@@ -1,0 +1,155 @@
+#!/usr/bin/env bash
+# Run DOS commands inside 86Box and capture stdout — the 86box analogue of
+# `dosbox-cmd`.
+#
+# Pipeline:
+#   1. Build a 1.44 MB FAT12 floppy image with RUN.BAT containing the
+#      caller's commands (with stdout redirected to A:\OUT.TXT) plus any
+#      .EXE/.COM files the caller put on stdin via heredoc-style inputs.
+#   2. Attach that floppy as fdd_01 in the project's 86box.cfg.
+#   3. Make sure DOS C:\AUTOEXEC.BAT is configured to run A:\RUN.BAT after
+#      boot — the template's AUTOEXEC.BAT is patched on first use.
+#   4. Boot 86Box (or reset if already running).
+#   5. Wait for A:\DONE marker file to appear in the floppy image.
+#   6. Read A:\OUT.TXT back via mtools and print to stdout.
+#
+# Usage:
+#     86box-cmd "DIR C:\\"
+#     printf 'VER\nDIR\n' | 86box-cmd
+#     86box-cmd --vm /dos/c "MEM /C"
+#
+# Env:
+#   BOX86_VM_PATH   default project VM dir (default: /dos/c)
+#   BOX86_TIMEOUT   max seconds to wait for DONE (default: 60)
+set -euo pipefail
+
+: "${BOX86_VM_PATH:=/dos/c}"
+: "${BOX86_TIMEOUT:=60}"
+# All toolkit components are installed onto PATH as `86box-<name>` by the
+# Dockerfile. We call them by name so this script works whether invoked as
+# /usr/local/bin/86box-cmd or /workspace/tools/86box/cmd.
+command -v 86box-run >/dev/null 2>&1 || {
+    echo "86box-cmd: 86box-run not on PATH — is the toolkit installed?" >&2
+    exit 1
+}
+
+VM_PATH="${BOX86_VM_PATH}"
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --vm)      VM_PATH="$2"; shift 2;;
+        --timeout) BOX86_TIMEOUT="$2"; shift 2;;
+        --)        shift; break;;
+        -*)        echo "unknown flag: $1" >&2; exit 2;;
+        *)         break;;
+    esac
+done
+
+CMD_TEXT=""
+if [ "$#" -gt 0 ]; then
+    # Each positional arg is one DOS command line.
+    CMD_TEXT="$(printf '%s\n' "$@")"
+elif [ ! -t 0 ]; then
+    CMD_TEXT="$(cat)"
+fi
+if [ -z "${CMD_TEXT}" ]; then
+    sed -n '2,28p' "$0"; exit 1
+fi
+
+[ -d "${VM_PATH}" ] || { echo "VM path does not exist: ${VM_PATH}" >&2; exit 1; }
+[ -f "${VM_PATH}/86box.cfg" ] || {
+    echo "no 86box.cfg in ${VM_PATH} — generate one with gen-config.py" >&2
+    exit 1
+}
+# Accept either a raw .img or a .vhd; gen-config defaults to dos.img.
+if [ ! -f "${VM_PATH}/dos.img" ] && [ ! -f "${VM_PATH}/dos.vhd" ]; then
+    echo "no dos.img or dos.vhd in ${VM_PATH}" >&2; exit 1
+fi
+
+# Build the floppy image.
+FLOPPY="${VM_PATH}/AGENT.IMG"
+RUN_BAT="$(mktemp -t runXXXX.bat)"
+cleanup() { rm -f "${RUN_BAT}"; }
+trap cleanup EXIT
+
+# Generate RUN.BAT: every command line gets >> A:\OUT.TXT appended unless it
+# already contains a redirect or is a flow-control directive.
+{
+    printf '@echo off\r\n'
+    printf 'echo START > A:\\OUT.TXT\r\n'
+    while IFS= read -r line || [ -n "${line}" ]; do
+        # Skip empty lines
+        [ -z "${line}" ] && continue
+        case "${line,,}" in
+            @echo*|rem*|::*) printf '%s\r\n' "${line}";;
+            *)
+                if printf '%s' "${line}" | grep -q '>'; then
+                    printf '%s\r\n' "${line}"
+                else
+                    printf '%s >> A:\\OUT.TXT\r\n' "${line}"
+                fi
+                ;;
+        esac
+    done <<< "${CMD_TEXT}"
+    printf 'echo __86BOX_AGENT_DONE__ >> A:\\OUT.TXT\r\n'
+    printf 'echo done > A:\\DONE\r\n'
+} > "${RUN_BAT}"
+
+# Create blank 1.44 MB floppy image and copy RUN.BAT in
+rm -f "${FLOPPY}"
+mformat -C -f 1440 -i "${FLOPPY}" ::
+mcopy -i "${FLOPPY}" "${RUN_BAT}" ::RUN.BAT
+
+# Update the VM's 86box.cfg so fdd_01 attaches AGENT.IMG and 35_2hd.
+# Ensure cfg is writable for our patch (86box-run marks it 0444 while up).
+chmod u+w "${VM_PATH}/86box.cfg"
+python3 - "${VM_PATH}/86box.cfg" "${FLOPPY}" <<'PY'
+import sys, re
+cfg_path, floppy = sys.argv[1], sys.argv[2]
+text = open(cfg_path).read()
+def patch_section(name, kvs):
+    global text
+    # Match the [Section] header through any keys until next [ header or EOF.
+    # The [^\[] character class includes \n, so we capture multiline bodies.
+    pat = re.compile(rf'\[{re.escape(name)}\]\n[^\[]*', re.DOTALL)
+    block = f"[{name}]\n" + "".join(f"{k} = {v}\n" for k, v in kvs.items()) + "\n"
+    text = pat.sub(block, text) if pat.search(text) else text + "\n" + block
+patch_section("Floppy and CD-ROM drives", {
+    "fdd_01_type": "35_2hd",
+    "fdd_01_fn": floppy,
+    "fdd_02_type": "525_2hd",
+})
+open(cfg_path, "w").write(text)
+PY
+
+# NOTE: The C:\AUTOEXEC.BAT hook (`IF EXIST A:\RUN.BAT CALL A:\RUN.BAT`) is
+# installed once at /dos/c/dos.vhd seed time by entrypoint.sh. mtools can't
+# write to dynamic VHDs directly, so doing it per command would require a
+# slow qemu-img round-trip on every invocation.
+
+# Boot the VM — fresh start each time, since DOS doesn't re-read AUTOEXEC.BAT.
+86box-run stop 2>/dev/null || true
+86box-run start "${VM_PATH}"
+86box-run wait-vnc >/dev/null
+
+# Poll for A:\DONE in the floppy image (mtools sees writes after they're
+# flushed by DOS).
+START="$(date +%s)"
+while :; do
+    if mdir -i "${FLOPPY}" ::DONE >/dev/null 2>&1; then
+        break
+    fi
+    NOW="$(date +%s)"
+    if [ "$((NOW - START))" -ge "${BOX86_TIMEOUT}" ]; then
+        echo "86box-cmd: timeout after ${BOX86_TIMEOUT}s" >&2
+        echo "Last screen capture: $(86box-run status)" >&2
+        86box-run stop 2>/dev/null || true
+        exit 1
+    fi
+    sleep 1
+done
+
+# Pull OUT.TXT and print
+mtype -i "${FLOPPY}" ::OUT.TXT 2>/dev/null || {
+    echo "no A:\\OUT.TXT produced"; exit 1
+}
+86box-run stop 2>/dev/null || true

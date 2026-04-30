@@ -1,0 +1,6 @@
+build/
+# wcl drops intermediate .o files in CWD, not -fe= dir
+*.o
+*.obj
+*.map
+*.err

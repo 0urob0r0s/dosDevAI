@@ -1,0 +1,68 @@
+services:
+  dos-claude:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      platforms:
+        - linux/amd64
+      args:
+        USERNAME: coder
+        USER_UID: 1000
+        USER_GID: 1000
+        # Bump these to update 86Box.
+        BOX86_VERSION: v5.3
+        BOX86_BUILD: b8200
+
+    image: dos-claude:86box
+    container_name: dos-claude
+    platform: linux/amd64
+
+    stdin_open: true
+    tty: true
+
+    environment:
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      DOS_ROOT: /dos/c
+      DOS_SRC: /dos/src
+      BOX86_VM_PATH: /dos/c
+      BOX86_VNC_PORT: 5901
+      BOX86_TIMEOUT: ${BOX86_TIMEOUT:-60}
+
+    ports:
+      # 5901  → VNC. Connect with `open vnc://localhost:5901` (macOS) or any
+      #          VNC client. No password (dev sandbox; do not expose to public
+      #          networks). Used by the agent via vncdotool and by you for
+      #          observation. Explicitly bound to all interfaces — entrypoint
+      #          starts Xvfb + x11vnc at container start so the port is
+      #          reachable immediately, even before any 86Box session boots.
+      - "0.0.0.0:5901:5901"
+      # 5556  → reserved for projects that route a TCP service through to the
+      #          host (e.g. a Linux daemon's listener that the agent on the
+      #          host wants to talk to). 86Box's serial1 itself uses host PTY
+      #          passthrough discovered by `86box-bridge`, NOT this port —
+      #          v5.3 b8200 ignores tcp_server mode in cfg and falls back to
+      #          openpty() regardless. The port is left mapped for project
+      #          use; remove it if your project doesn't need it.
+      - "0.0.0.0:5556:5556"
+
+    volumes:
+      - type: bind
+        source: ./dos-c
+        target: /dos/c
+        bind:
+          create_host_path: true
+
+      - type: bind
+        source: ./workspace
+        target: /workspace
+        bind:
+          create_host_path: true
+
+      - type: bind
+        source: ./.claude
+        target: /home/coder/.claude
+        bind:
+          create_host_path: true
+
+    working_dir: /workspace
+    command: /bin/bash

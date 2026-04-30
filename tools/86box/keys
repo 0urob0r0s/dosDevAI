@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# Inject keystrokes into 86Box via VNC.
+#
+# Usage:
+#   86box-keys type "DIR C:\\"        type literal text (no Enter)
+#   86box-keys press enter            press one named key
+#   86box-keys line "DIR C:\\"        type text + press Enter
+#   86box-keys raw -- type "DIR" key enter   pass remaining args verbatim to vncdo
+#
+# Env: BOX86_VNC_PORT (default 5901), BOX86_VNC_HOST (default 127.0.0.1)
+set -euo pipefail
+
+: "${BOX86_VNC_HOST:=127.0.0.1}"
+: "${BOX86_VNC_PORT:=5901}"
+
+VNCDO="${VNCDO:-vncdo}"
+command -v "${VNCDO}" >/dev/null 2>&1 || VNCDO="${HOME}/.local/bin/vncdo"
+command -v "${VNCDO}" >/dev/null 2>&1 || { echo "vncdo not found (install vncdotool)" >&2; exit 1; }
+
+vnc() { "${VNCDO}" -s "${BOX86_VNC_HOST}::${BOX86_VNC_PORT}" "$@"; }
+
+case "${1:-}" in
+    type)  shift; vnc type "$*";;
+    press) shift; vnc key "$*";;
+    line)  shift; vnc type "$*" key enter;;
+    raw)   shift; [ "${1:-}" = "--" ] && shift; vnc "$@";;
+    *)
+        sed -n '2,11p' "$0"
+        exit 1
+        ;;
+esac

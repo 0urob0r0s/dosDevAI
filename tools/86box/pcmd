@@ -1,0 +1,375 @@
+#!/usr/bin/env python3
+"""86box-pcmd — persistent DOS shell over COM2.
+
+Boots 86Box once (~30 s), runs PCMDD.EXE on the DOS side as the last
+AUTOEXEC step (which loops forever reading commands from COM2), and
+keeps the session alive so subsequent `run` calls just submit another
+command and read the response. TSR state (loaded SerialDFS, environment
+vars, current dir) survives across calls.
+
+Subcommands:
+    86box-pcmd start            boot 86Box + bring up COM2 bridge + verify
+                                pcmdd is listening
+    86box-pcmd run "DOS CMD"    submit a command, print stdout, exit with
+                                the DOS errorlevel
+    86box-pcmd stop             tear down 86Box and the COM2 bridge
+    86box-pcmd status           show pid / readiness
+
+Wire protocol on /tmp/linux-com2 (set up by `86box-bridge --port 2`):
+
+    Request   host -> DOS:  uint16 cmd_len, byte cmd[cmd_len]
+    Response  DOS  -> host: uint16 out_len, uint8 errorlevel, byte out[out_len]
+
+History: an earlier `86box-pcmd` tried to use the AGENT.IMG floppy as
+the IPC channel and failed because DOS BUFFERS caches the FAT/dir of
+the host-mutated floppy (see feedback memory file
+`feedback_no_floppy_poll.md`). This implementation moves the IPC to a
+dedicated serial port that DOS-side code (PCMDD.EXE) drives, so DOS
+itself does all the writes — cache stays coherent.
+"""
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import signal
+import struct
+import subprocess
+import sys
+import time
+
+DEFAULT_VM_PATH = os.environ.get('BOX86_VM_PATH', '/dos/c')
+DEFAULT_LINK    = '/tmp/linux-com2'
+DEFAULT_PIDFILE = '/tmp/86box/pcmd.pid'
+DEFAULT_BAUD    = 9600
+DEFAULT_TIMEOUT = float(os.environ.get('BOX86_PCMD_TIMEOUT', 60.0))
+
+PCMDD_EXE_HOST = '/opt/dos-c-base/pcmdd/PCMDD.EXE'
+PCMDD_EXE_DEV  = '/workspace/tools/86box/dos/build/PCMDD.EXE'
+PCMDD_DOS_PATH = r'C:\PCMDD.EXE'
+
+# AUTOEXEC.BAT line that launches the REPL once 86box-cmd's RUN.BAT
+# (if any) has had a chance to run. The hook is added/removed by
+# `pcmd start` / `pcmd stop` so it doesn't interfere with normal
+# 86box-cmd cold-boots.
+AUTOEXEC_HOOK_SENTINEL = 'REM 86box-pcmd v2 hook'
+AUTOEXEC_HOOK_LINE     = r'IF EXIST C:\PCMDD.EXE C:\PCMDD.EXE'
+
+# Old, no-longer-used hook from the abandoned floppy-poll attempt; if we
+# see it in AUTOEXEC.BAT we strip it so it doesn't sit on the line above
+# us doing nothing visible but burning startup time on every boot.
+LEGACY_HOOK_SENTINELS = (
+    'REM 86box-pcmd hook',                  # the v1 sentinel
+    r'IF EXIST A:\PCMD.BAT CALL A:\PCMD.BAT',
+)
+
+
+# ---------- helpers ---------------------------------------------------------
+
+def _pid_alive(pidfile: str) -> int | None:
+    try:
+        pid = int(open(pidfile).read().strip())
+    except (OSError, ValueError):
+        return None
+    try:
+        os.kill(pid, 0)
+        return pid
+    except OSError:
+        return None
+
+
+def _pcmdd_exe() -> str:
+    """Locate the baked PCMDD.EXE (image build) or the dev build."""
+    if os.path.exists(PCMDD_EXE_HOST):
+        return PCMDD_EXE_HOST
+    if os.path.exists(PCMDD_EXE_DEV):
+        return PCMDD_EXE_DEV
+    raise FileNotFoundError(
+        f"PCMDD.EXE not found at {PCMDD_EXE_HOST} or {PCMDD_EXE_DEV}. "
+        "Run /workspace/tools/86box/dos/build.sh to build it.")
+
+
+def _check_no_86box() -> None:
+    out = subprocess.run(['pgrep', '-f', '[8]6Box.*86box.cfg'],
+                         capture_output=True, text=True)
+    if out.stdout.strip():
+        raise SystemExit("ERROR: 86Box is running — stop it first "
+                         "('86box-pcmd stop' or '86box-run stop').")
+
+
+def _patch_autoexec(vm_path: str, install: bool) -> None:
+    """Add (install=True) or remove the pcmdd hook in dos.img:AUTOEXEC.BAT."""
+    img = os.path.join(vm_path, 'dos.img')
+    off = 62 * 512
+    import tempfile
+    with tempfile.NamedTemporaryFile(delete=False) as cur:
+        cur_path = cur.name
+    subprocess.run(['mtype', '-i', f'{img}@@{off}', '::AUTOEXEC.BAT'],
+                   stdout=open(cur_path, 'wb'), stderr=subprocess.DEVNULL,
+                   check=False)
+    text = open(cur_path, 'rb').read().decode('latin-1', errors='replace')
+
+    # Strip our v2 hook (if present) and any legacy v1 hook lines, so the
+    # add/remove logic always starts from a known-clean baseline.
+    lines = text.splitlines(keepends=True)
+    cleaned = []
+    skip_next = False
+    for ln in lines:
+        if skip_next:
+            skip_next = False
+            continue
+        # v2 sentinel: skip sentinel + next line (the hook itself)
+        if AUTOEXEC_HOOK_SENTINEL in ln:
+            skip_next = True
+            continue
+        # any legacy fragment: drop the line entirely
+        if any(s in ln for s in LEGACY_HOOK_SENTINELS):
+            continue
+        cleaned.append(ln)
+    base = ''.join(cleaned).rstrip('\r\n')
+
+    if install:
+        new = base + '\r\n' + AUTOEXEC_HOOK_SENTINEL + '\r\n' + \
+              AUTOEXEC_HOOK_LINE + '\r\n'
+    else:
+        new = base + '\r\n'
+
+    if new == text:
+        os.unlink(cur_path)
+        return  # no change
+    with tempfile.NamedTemporaryFile(delete=False) as nf:
+        nf.write(new.encode('latin-1', errors='replace'))
+        new_path = nf.name
+    subprocess.run(['mcopy', '-o', '-i', f'{img}@@{off}', new_path,
+                    '::AUTOEXEC.BAT'], check=True)
+    os.unlink(cur_path); os.unlink(new_path)
+
+
+def _open_serial(link: str, baud: int):
+    import serial
+    s = serial.Serial(link, baud, timeout=2.0)
+    return s
+
+
+def _send_cmd_recv(link: str, baud: int, cmd: str,
+                   timeout: float) -> tuple[int, bytes]:
+    """Send a command, return (errorlevel, stdout_bytes)."""
+    import serial
+    cmd_b = cmd.encode('cp437', errors='replace')
+    if len(cmd_b) > 512:
+        raise SystemExit("ERROR: command too long (max 512 bytes)")
+    payload = struct.pack('<H', len(cmd_b)) + cmd_b
+    s = _open_serial(link, baud)
+    s.timeout = timeout
+    try:
+        s.write(payload)
+        s.flush()
+        # Read 3-byte header: uint16 out_len + uint8 errorlevel
+        hdr = b''
+        deadline = time.monotonic() + timeout
+        while len(hdr) < 3:
+            chunk = s.read(3 - len(hdr))
+            if not chunk and time.monotonic() >= deadline:
+                raise SystemExit("ERROR: pcmd: response header timeout "
+                                 f"(read {len(hdr)}/3 bytes)")
+            hdr += chunk
+        out_len, rc = struct.unpack('<HB', hdr)
+        out = b''
+        while len(out) < out_len:
+            chunk = s.read(out_len - len(out))
+            if not chunk and time.monotonic() >= deadline:
+                raise SystemExit(
+                    f"ERROR: pcmd: response body timeout "
+                    f"({len(out)}/{out_len} bytes)")
+            out += chunk
+        return rc, out
+    finally:
+        s.close()
+
+
+# ---------- subcommands ----------------------------------------------------
+
+def cmd_start(args) -> int:
+    pid = _pid_alive(args.pidfile)
+    if pid:
+        print(f"86box-pcmd already running (PID {pid})")
+        return 0
+
+    pcmdd = _pcmdd_exe()
+    _check_no_86box()
+
+    # Ensure 86box.cfg has serial2 passthrough enabled.
+    cfg = os.path.join(args.vm, '86box.cfg')
+    cfg_text = open(cfg).read() if os.path.exists(cfg) else ''
+    if 'serial2_passthrough_enabled = 1' not in cfg_text:
+        print("[pcmd] adding serial2 passthrough to 86box.cfg")
+        subprocess.run(['86box-gen-config',
+                        '--out', cfg, '--vhd', 'dos.img',
+                        '--serial1-passthrough',
+                        '--serial2-passthrough'], check=True)
+        # Re-read for the floppy patch below.
+        cfg_text = open(cfg).read()
+
+    # Make sure AGENT.IMG exists and is attached as fdd_01. AUTOEXEC.BAT's
+    # `IF EXIST A:\RUN.BAT` (the legacy 86box-cmd hook) hangs on
+    # "Not ready reading drive A" if A: has no media, blocking PCMDD.EXE
+    # from ever being launched.
+    floppy = os.path.join(args.vm, 'AGENT.IMG')
+    if not os.path.exists(floppy):
+        print(f"[pcmd] mformat-ing {floppy}")
+        subprocess.run(['mformat', '-C', '-f', '1440', '-i', floppy, '::'],
+                       check=True)
+    else:
+        # Strip any leftover RUN.BAT from a previous 86box-cmd test —
+        # otherwise the legacy AUTOEXEC hook (`IF EXIST A:\RUN.BAT CALL`)
+        # fires a stale test and DOS hangs waiting on dead daemon traffic
+        # before PCMDD ever gets to run.
+        subprocess.run(['mdel', '-i', floppy, '::RUN.BAT'],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(['mdel', '-i', floppy, '::DONE'],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        subprocess.run(['mdel', '-i', floppy, '::OUT.TXT'],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if 'fdd_01_fn' not in cfg_text:
+        print("[pcmd] attaching AGENT.IMG to fdd_01 in 86box.cfg")
+        os.chmod(cfg, 0o644)
+        new_cfg = re.sub(
+            r'(\[Floppy and CD-ROM drives\]\n)([^\[]*)',
+            lambda m: m.group(1) +
+                      f"fdd_01_type = 35_2hd\nfdd_01_fn = {floppy}\n"
+                      "fdd_02_type = 525_2hd\n\n",
+            cfg_text, count=1, flags=re.DOTALL)
+        with open(cfg, 'w') as f:
+            f.write(new_cfg)
+
+    # Install PCMDD.EXE into dos.img and wire up the AUTOEXEC hook.
+    print(f"[pcmd] installing {pcmdd} → {PCMDD_DOS_PATH}")
+    subprocess.run(['86box-install-dos', '--to', 'C:\\', '--quiet', pcmdd],
+                   check=True)
+    _patch_autoexec(args.vm, install=True)
+
+    # Boot 86Box. We use 86box-run directly (not 86box-cmd) — we want a
+    # session that STAYS up; AUTOEXEC will run PCMDD.EXE as its last
+    # action and PCMDD never returns.
+    subprocess.run(['86box-run', 'stop'],
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    subprocess.run(['86box-run', 'start', args.vm], check=True)
+    subprocess.run(['86box-run', 'wait-vnc'], check=True,
+                   stdout=subprocess.DEVNULL)
+
+    # Bring up the COM2 bridge.
+    print("[pcmd] starting COM2 bridge → /tmp/linux-com2")
+    subprocess.run(['86box-bridge', '--link', DEFAULT_LINK,
+                    '--port', '2',
+                    '--pidfile', '/tmp/86box/pcmd-bridge.pid',
+                    '--outlog', '/tmp/86box/pcmd-bridge.log',
+                    'start'], check=True)
+
+    # Wait for PCMDD to be listening: probe with a noop (`ECHO`) until we
+    # get a response or timeout.
+    print("[pcmd] waiting for PCMDD.EXE to become responsive on COM2...")
+    deadline = time.monotonic() + 120.0
+    last_err = None
+    while time.monotonic() < deadline:
+        try:
+            rc, out = _send_cmd_recv(DEFAULT_LINK, DEFAULT_BAUD,
+                                     'REM ready check', timeout=8.0)
+            # Got a clean roundtrip — pcmdd is alive.
+            os.makedirs(os.path.dirname(args.pidfile), exist_ok=True)
+            # We don't have a single PID to track; record 86Box's pid as a
+            # liveness proxy.
+            try:
+                box_pid = int(open('/tmp/86box/86box.pid').read().strip())
+            except Exception:
+                box_pid = os.getpid()
+            with open(args.pidfile, 'w') as f:
+                f.write(str(box_pid))
+            print(f"[pcmd] ready (errorlevel={rc}, response_len={len(out)})")
+            return 0
+        except SystemExit as e:
+            last_err = e.args[0] if e.args else 'unknown'
+            time.sleep(2.0)
+        except Exception as e:
+            last_err = str(e)
+            time.sleep(2.0)
+
+    print(f"ERROR: PCMDD.EXE did not respond within 120 s "
+          f"(last error: {last_err})", file=sys.stderr)
+    return 1
+
+
+def cmd_run(args) -> int:
+    pid = _pid_alive(args.pidfile)
+    if not pid:
+        print("ERROR: 86box-pcmd is not running. Start it with "
+              "'86box-pcmd start'.", file=sys.stderr)
+        return 1
+    if not args.cmd:
+        print("ERROR: no command given", file=sys.stderr); return 2
+    cmd = ' '.join(args.cmd) if isinstance(args.cmd, list) else args.cmd
+    rc, out = _send_cmd_recv(DEFAULT_LINK, DEFAULT_BAUD, cmd,
+                             timeout=args.timeout)
+    sys.stdout.buffer.write(out)
+    sys.stdout.flush()
+    return rc
+
+
+def cmd_stop(args) -> int:
+    # Drop AUTOEXEC hook so future cold-boots don't accidentally launch
+    # the REPL (and hang anything that expects the DOS prompt).
+    subprocess.run(['86box-run', 'stop'],
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    subprocess.run(['86box-bridge',
+                    '--pidfile', '/tmp/86box/pcmd-bridge.pid', 'stop'],
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        _patch_autoexec(args.vm, install=False)
+    except Exception as e:
+        print(f"[pcmd] WARN: could not strip AUTOEXEC hook: {e}",
+              file=sys.stderr)
+    try:
+        os.unlink(args.pidfile)
+    except FileNotFoundError:
+        pass
+    print("86box-pcmd: stopped")
+    return 0
+
+
+def cmd_status(args) -> int:
+    pid = _pid_alive(args.pidfile)
+    if pid:
+        print(f"86box-pcmd: up (86Box PID {pid}, link {DEFAULT_LINK})")
+    else:
+        print("86box-pcmd: down")
+    return 0
+
+
+# ---------- dispatch -------------------------------------------------------
+
+def main() -> int:
+    p = argparse.ArgumentParser(description='86box-pcmd — persistent DOS REPL over COM2',
+                                allow_abbrev=False)
+    p.add_argument('--vm',      default=DEFAULT_VM_PATH)
+    p.add_argument('--pidfile', default=DEFAULT_PIDFILE)
+    p.add_argument('--timeout', type=float, default=DEFAULT_TIMEOUT,
+                   help='seconds to wait for a response (default 60, '
+                        'env BOX86_PCMD_TIMEOUT)')
+    sub = p.add_subparsers(dest='action')
+    sub.add_parser('start',  help='boot 86Box + bring up COM2 + verify pcmdd ready')
+    rp = sub.add_parser('run', help='submit a command, print stdout, exit with errorlevel')
+    rp.add_argument('cmd', nargs='+')
+    sub.add_parser('stop',   help='tear down 86Box + bridge')
+    sub.add_parser('status', help='show readiness')
+    args = p.parse_args()
+
+    action = args.action or 'status'
+    return {
+        'start':  cmd_start,
+        'run':    cmd_run,
+        'stop':   cmd_stop,
+        'status': cmd_status,
+    }[action](args)
+
+
+if __name__ == '__main__':
+    sys.exit(main())
