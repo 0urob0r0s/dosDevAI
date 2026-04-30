@@ -43,15 +43,23 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         python3-pip \
         nodejs \
         npm \
-        # 86Box runtime libraries (the AppImage ships some, but apt
-        # versions are what the host loader picks up first).
+        software-properties-common \
+        # ── dosemu2 (PRIMARY emulator) + DOS core ──────────────────
+        dosemu2 \
+        fdpp \
+        # window manager + terminal for the live-VNC mode of dosemu2
+        fluxbox \
+        xterm \
+        xdotool \
+        # 86Box runtime libraries (alternative emulator; AppImage ships
+        # some, but apt versions are what the host loader picks up first).
         libpcre3 libxcb1 libxcb-image0 libxcb-keysyms1 libxcb-randr0 \
         libxcb-render0 libxcb-shape0 libxcb-shm0 libxcb-sync1 \
         libxcb-xfixes0 libxcb-xkb1 libxcb-render-util0 libxcb-icccm4 \
         libxkbcommon-x11-0 libfontconfig1 libxrender1 libdbus-1-3 \
         libslirp0 libsndfile1 libfluidsynth3 libopenal1 libfreetype6 \
         libpng16-16 libxi6 libwayland-client0 \
-        # headless display + VNC bridge
+        # headless display + VNC bridge (shared by both emulators)
         xvfb x11vnc xauth x11-utils x11-apps \
         # disk image manipulation for 86box-cmd file pipeline
         qemu-utils mtools \
@@ -195,6 +203,33 @@ RUN chown -R ${USERNAME}:${USERNAME} /opt/dos-c-base/examples
 # --------------------------------------------------------------------
 # Container entry.
 # --------------------------------------------------------------------
+# --------------------------------------------------------------------
+# dosemu2 helper toolkit (PRIMARY emulator path).
+# Naming convention parallels the 86box layer: every script lands at
+# /usr/local/bin/dosemu-<name>; source filenames in tools/dosemu/ keep
+# their natural extension (.sh) for editor support.
+# --------------------------------------------------------------------
+COPY tools/dosemu/setup.sh                  /usr/local/bin/dosemu-setup
+COPY tools/dosemu/run.sh                    /usr/local/bin/dosemu-run
+COPY tools/dosemu/cmd                       /usr/local/bin/dosemu-cmd
+COPY tools/dosemu/vnc-start.sh              /usr/local/bin/dosemu-vnc-start
+COPY tools/dosemu/vnc-stop.sh               /usr/local/bin/dosemu-vnc-stop
+COPY tools/dosemu/dosemurc.template         /opt/dosemu/dosemurc.template
+COPY tools/dosemu/dosemu-vnc.rc.template    /opt/dosemu/dosemu-vnc.rc.template
+RUN chmod +x /usr/local/bin/dosemu-* \
+    && mkdir -p /opt/dosemu \
+    && cp -n /opt/dosemu/dosemurc.template       /etc/skel/.dosemurc       || true \
+    && cp -n /opt/dosemu/dosemu-vnc.rc.template  /etc/skel/.dosemu-vnc.rc  || true \
+    && cp -n /opt/dosemu/dosemurc.template       /home/${USERNAME}/.dosemurc       \
+    && cp -n /opt/dosemu/dosemu-vnc.rc.template  /home/${USERNAME}/.dosemu-vnc.rc  \
+    && chown ${USERNAME}:${USERNAME} \
+        /home/${USERNAME}/.dosemurc /home/${USERNAME}/.dosemu-vnc.rc
+
+# Toolkit smoke tests for the dosemu2 path.
+COPY tools/dosemu/tests /usr/local/share/dosemu-tests
+RUN chmod +x /usr/local/share/dosemu-tests/*.sh 2>/dev/null || true \
+    && chown -R ${USERNAME}:${USERNAME} /usr/local/share/dosemu-tests
+
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
 

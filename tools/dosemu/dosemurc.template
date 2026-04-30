@@ -1,0 +1,58 @@
+# dosemu2 default config — dumb-mode, PTY COM1, hostfs-friendly.
+#
+# This is the baseline config installed for every user. dosemu reads
+# it from $HOME/.dosemurc on every launch unless `-f <other-rc>` is
+# given. Per-mode rc files (e.g. ~/.dosemu-vnc.rc) override individual
+# settings on top of this.
+#
+# Key choices:
+#   - $_video = "none"  →  no graphical display; dosemu writes the DOS
+#                          screen as text into the controlling stdout.
+#                          This is the "dumb" mode used by dosemu-cmd
+#                          and any non-interactive test driver.
+#   - $_com1 = "pts ..."→  COM1 is backed by a Linux PTY pair. Linux
+#                          processes attach to /tmp/dos-com1; DOS sees
+#                          a regular 16550 UART at port 0x3F8.
+#                          NO bridge needed (unlike 86Box).
+#   - $_cpu_vm = emulated, $_cpuemu = (1)
+#                          Full software CPU emulation. Slower than
+#                          KVM/JIT but works inside qemu-x86_64 user
+#                          mode, which is what Apple Silicon hosts run
+#                          when they execute a linux/amd64 container.
+
+$_video = "none"
+$_term_color = (off)
+$_term_updfreq = (4)
+$_external_char_set = "utf8"
+
+# COM1 → PTY. Linux side opens /tmp/dos-com1 directly; DOS side sees
+# a stock 8250/16550 at 0x3F8. No host-side bridge / throttle needed.
+$_com1 = "pts /tmp/dos-com1"
+
+# No COM2 by default — uncomment if you need a second serial channel.
+# $_com2 = "pts /tmp/dos-com2"
+
+# Don't auto-mount any hostfs drives from here — projects pass `-d
+# /path/to/dir` on the dosemu cmdline instead, which assigns the next
+# available drive letter (typically G: after C: D: E: F: are taken by
+# the bundled FreeDOS template).
+$_hostfs_drives = ""
+
+# Trim peripherals we don't need so resident memory stays large.
+$_lpt1 = ""
+$_lpt2 = ""
+$_sound = (off)
+$_joystick = ""
+$_mouse_internal = (off)
+$_emm386 = (off)
+$_layout = "us"
+$_keybint = (on)
+
+# CPU/DPMI in pure-emulation. Required when running under qemu-x86_64
+# user-mode (Apple Silicon hosts running linux/amd64 containers): the
+# JIT path tries mmap with PROT_EXEC|PROT_WRITE which fails through
+# qemu-user. Native amd64 hosts can flip these to "kvm"/"native" for
+# a 5-10x speedup, but the emulated path works everywhere.
+$_cpu_vm = "emulated"
+$_cpu_vm_dpmi = "emulated"
+$_cpuemu = (1)

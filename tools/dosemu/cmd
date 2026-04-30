@@ -1,0 +1,164 @@
+#!/usr/bin/env bash
+# dosemu-cmd — non-interactive DOS command runner backed by dosemu2 in
+# dumb mode. The cleanroom equivalent of `86box-cmd`.
+#
+# Each invocation:
+#   1. reaps any leftover dosemu/serdfsd/etc. processes from prior runs
+#   2. cleans /tmp PTY symlinks, $XDG_RUNTIME_DIR/dosemu2/* FIFOs
+#   3. spawns a fresh dosemu under qemu-x86_64 in dumb mode
+#   4. waits for the "Welcome to dosemu2" banner
+#   5. feeds DOS commands from $@ (one per arg, sleep 3 between)
+#   6. plus an extra grace period after the LAST command (configurable
+#      so things like a TSR handler retry/timeout window can finish)
+#   7. captures the controlling stdout (= the DOS screen) into stdout
+#   8. tears down everything (dosemu + any host-side daemons it spawned
+#      via --daemon, plus all FIFOs / PTY symlinks)
+#
+# Why a per-call cleanroom?
+#   dosemu's UART emulation accumulates state across runs in subtle
+#   ways. The same SerialDFS binary went from "installs OK and runs
+#   N RPCs" to "install fails" mid-session with no source change —
+#   purely from cumulative test-run state. The fix is to refresh
+#   dosemu on every test, and that's what this driver does.
+#
+# Usage:
+#   dosemu-cmd "DIR C:"
+#   dosemu-cmd "DIR" "VER" "MEM /C"
+#   dosemu-cmd --mount /dos/c/serdfs/dos/build "G:" "DIR"
+#   dosemu-cmd --daemon "cd /dos/c/serdfs && python3 -m linux.serdfsd \
+#                          --serial /tmp/dos-com1 --baud 9600 \
+#                          --root /workspace/DOS --log-level DEBUG" \
+#              --mount /dos/c/serdfs/dos/build \
+#              "G:" "SERDFS X /COM1 /BAUD:9600" "X:" "DIR X:"
+#
+# Flags:
+#   --mount DIR             pass `-d DIR` to dosemu (assigned to next free letter, usually G:)
+#   --daemon "CMD ..."      run CMD as a background Linux process AFTER dosemu's PTY appears
+#                           (useful for SerialDFS-like serial daemons). Multiple --daemon allowed.
+#   --tail-sleep SECONDS    extra wait after the LAST DOS command (default 6s)
+#   --cmd-sleep  SECONDS    wait between successive DOS commands (default 3s)
+#   --rc PATH               override which dosemu rc file to use (default ~/.dosemurc)
+#   --dos-log PATH          where to dump the full DOS screen capture (default /tmp/dos.log)
+#   --daemon-log PATH       where to dump combined daemon output (default /tmp/dosemu-cmd-daemons.log)
+#   --keep                  do NOT tear down at exit (leaves dosemu running for inspection)
+#   -h | --help
+set -u
+
+DOS_LOG=/tmp/dos.log
+DAEMON_LOG=/tmp/dosemu-cmd-daemons.log
+RC="$HOME/.dosemurc"
+TAIL_SLEEP=6
+CMD_SLEEP=3
+KEEP=0
+MOUNTS=()
+DAEMONS=()
+DOS_CMDS=()
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --mount)       MOUNTS+=("$2"); shift 2 ;;
+        --daemon)      DAEMONS+=("$2"); shift 2 ;;
+        --tail-sleep)  TAIL_SLEEP="$2"; shift 2 ;;
+        --cmd-sleep)   CMD_SLEEP="$2"; shift 2 ;;
+        --rc)          RC="$2"; shift 2 ;;
+        --dos-log)     DOS_LOG="$2"; shift 2 ;;
+        --daemon-log)  DAEMON_LOG="$2"; shift 2 ;;
+        --keep)        KEEP=1; shift ;;
+        -h|--help)
+            sed -n '2,/^set -u/p' "$0" | sed 's/^# \?//'
+            exit 0 ;;
+        --) shift; while [ $# -gt 0 ]; do DOS_CMDS+=("$1"); shift; done ;;
+        *)  DOS_CMDS+=("$1"); shift ;;
+    esac
+done
+
+FIFO=/tmp/dos-stdin-cmd
+> "${DOS_LOG}"
+> "${DAEMON_LOG}"
+
+# ── 1. Reap leftover state ─────────────────────────────────────────
+ps -eo pid,ppid,args | awk '
+    $2==1 && (/dosemu2\.bin|\/usr\/bin\/dosemu/) {print $1}
+' | xargs -r kill -9 2>/dev/null || true
+pkill -9 -f 'qemu-x86_64.*dosemu2\.bin' 2>/dev/null || true
+sleep 1
+rm -f /tmp/dos-com1 "${FIFO}"
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/tmp/runtime-coder}"
+mkdir -p "${XDG_RUNTIME_DIR}" && chmod 700 "${XDG_RUNTIME_DIR}"
+rm -rf "${XDG_RUNTIME_DIR}/dosemu2"
+mkdir -p "${XDG_RUNTIME_DIR}/dosemu2"
+
+# ── 2. Spawn dosemu in dumb mode, attached to a controllable FIFO ──
+mkfifo "${FIFO}"
+
+DOSEMU_ARGS=(-dumb -n -f "${RC}")
+for m in "${MOUNTS[@]:-}"; do
+    [ -n "$m" ] && DOSEMU_ARGS+=(-d "$m")
+done
+
+# Open FIFO read+write so opening-for-write doesn't block before
+# dosemu has opened the read side.
+exec 3<>"${FIFO}"
+
+(
+    dosemu "${DOSEMU_ARGS[@]}" < "${FIFO}" > "${DOS_LOG}" 2>&1
+) &
+DOSEMU_PID=$!
+
+# ── 3. Wait for boot completion (Welcome banner) ───────────────────
+for _ in $(seq 1 60); do
+    grep -q 'Welcome to dosemu2' "${DOS_LOG}" 2>/dev/null && break
+    sleep 0.5
+done
+
+# ── 4. Wait for /tmp/dos-com1 PTY symlink (only matters with --daemon)
+if [ "${#DAEMONS[@]}" -gt 0 ]; then
+    for _ in $(seq 1 60); do
+        [ -L /tmp/dos-com1 ] && break
+        sleep 0.5
+    done
+fi
+
+# ── 5. Spawn user daemons ──────────────────────────────────────────
+DAEMON_PIDS=()
+for d in "${DAEMONS[@]:-}"; do
+    [ -n "$d" ] || continue
+    bash -c "$d" >> "${DAEMON_LOG}" 2>&1 &
+    DAEMON_PIDS+=($!)
+done
+
+sleep 1
+
+# ── 6. Feed DOS commands ───────────────────────────────────────────
+N=${#DOS_CMDS[@]}
+i=0
+for c in "${DOS_CMDS[@]:-}"; do
+    [ -n "${c:-}" ] || continue
+    i=$((i+1))
+    echo "$c" >&3
+    if [ "$i" -eq "$N" ]; then sleep "${TAIL_SLEEP}"
+    else                       sleep "${CMD_SLEEP}"
+    fi
+done
+
+# Best-effort clean DOS shutdown so AUTOEXEC and any TSR cleanup runs.
+echo "exit" >&3
+sleep 2
+
+# ── 7. Capture & teardown ──────────────────────────────────────────
+exec 3>&-
+cat "${DOS_LOG}"
+
+if [ "${KEEP}" -eq 0 ]; then
+    kill -9 "${DOSEMU_PID}" 2>/dev/null || true
+    for p in "${DAEMON_PIDS[@]:-}"; do kill -9 "$p" 2>/dev/null || true; done
+    # Reap any dosemu/qemu-wrapped-dosemu/fdpp processes the user
+    # script spawned. Walk the process tree from any survivor.
+    ps -eo pid,ppid,args | awk '
+        $2==1 && /dosemu2\.bin|\/usr\/bin\/dosemu/ {print $1}
+    ' | xargs -r kill -9 2>/dev/null || true
+    pkill -9 -f 'qemu-x86_64.*dosemu2\.bin' 2>/dev/null || true
+    sleep 0.3
+    rm -f "${FIFO}" /tmp/dos-com1
+    rm -rf "${XDG_RUNTIME_DIR}/dosemu2"
+fi

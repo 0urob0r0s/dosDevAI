@@ -1,4 +1,12 @@
-# `tools/86box/` — the 86Box helper toolkit
+# `tools/86box/` — the 86Box helper toolkit (alternative emulator)
+
+> ⚠️  **dosemu2 is the primary emulator** in this sandbox. See
+> [`tools/dosemu/README.md`](../dosemu/README.md) for the preferred
+> path. Use 86Box when you specifically need real BIOS, real IDE
+> controller behavior, or to verify that something works on actual-
+> hardware-class emulation. For iterative dev — TSRs, redirectors,
+> CI-style tests — start with `dosemu-cmd` not `86box-cmd`. It boots
+> in 2-3 s instead of 30 s and mounts host directories directly.
 
 These scripts wrap 86Box for headless, agent-driven, reproducible use
 inside the DOS Dev Sandbox container. Read [`/workspace/AGENT.md`](../../AGENT.md)

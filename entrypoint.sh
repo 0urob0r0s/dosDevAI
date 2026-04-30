@@ -82,10 +82,32 @@ if [ -d "${EX_BAKE}" ] && [ ! -d "${EX_LIVE}" ]; then
     cp -an "${EX_BAKE}/." "${EX_LIVE}/"
 fi
 
+# Seed user dosemu2 configs if missing — first-run on a fresh bind-
+# mounted /home/coder bare-bones HOME won't have them otherwise.
+DOSEMU_TEMPLATE_DIR=/opt/dosemu
+if [ -d "${DOSEMU_TEMPLATE_DIR}" ]; then
+    [ -f "${HOME}/.dosemurc" ] || \
+        cp "${DOSEMU_TEMPLATE_DIR}/dosemurc.template"      "${HOME}/.dosemurc"
+    [ -f "${HOME}/.dosemu-vnc.rc" ] || \
+        cp "${DOSEMU_TEMPLATE_DIR}/dosemu-vnc.rc.template" "${HOME}/.dosemu-vnc.rc"
+fi
+mkdir -p "${HOME}/.dosemu/drive_c"
+
+# Warm dosemu's first-boot cache (FDPP unpacks fdppconf.sys, sets up
+# drive_c) so the FIRST `dosemu-cmd` after container start doesn't pay
+# the one-time setup cost. Idempotent: subsequent runs are a no-op.
+if [ ! -f "${HOME}/.dosemu/drive_c/fdppconf.sys" ]; then
+    timeout 8 dosemu -dumb -n -E exit </dev/null >/dev/null 2>&1 || true
+fi
+
 # Start the headless display stack so port 5901 (mapped to the host) is
-# reachable from the moment the container is up. 86Box itself only starts
-# on demand via `86box-cmd` / `86box-run start`. If the user launches
-# `claude` instead of `bash`, the display stack is already warm.
-86box-run display-up >/dev/null 2>&1 || true
+# reachable from the moment the container is up. Used by BOTH dosemu2's
+# `dosemu-vnc-start` (fluxbox + xterm) and 86Box's Qt window. Either
+# tool's `*-run start` is a no-op if the display is already up.
+if command -v dosemu-run >/dev/null 2>&1; then
+    dosemu-run display-up >/dev/null 2>&1 || true
+elif command -v 86box-run >/dev/null 2>&1; then
+    86box-run display-up >/dev/null 2>&1 || true
+fi
 
 exec "$@"

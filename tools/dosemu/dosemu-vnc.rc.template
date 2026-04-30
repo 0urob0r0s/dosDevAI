@@ -1,0 +1,36 @@
+# dosemu2 config for the VNC-with-fluxbox interactive mode.
+#
+# Used by `dosemu-vnc-start` when a human wants to type at the DOS
+# prompt and watch the screen update live. dosemu still runs in
+# `$_video = "none"` (dumb), but renders into an xterm window managed
+# by fluxbox under Xvfb at DISPLAY=:99. x11vnc exports that desktop
+# on port 5901 so the user connects with any VNC client.
+#
+# Differences from ~/.dosemurc:
+#   - identical content — kept as a separate file so per-mode tweaks
+#     (e.g. $_term_color) can diverge later without touching the
+#     batch / dumb config used by dosemu-cmd.
+#
+# Why dumb mode under VNC instead of the SDL/X11 video targets?
+#   dosemu2's SDL/X11 video targets render the VGA framebuffer into a
+#   native window via SDL_image / X. This works on bare Linux but is
+#   unreliable inside Docker + Xvfb under qemu-x86_64 (no OpenGL, no
+#   shared memory extensions). Dumb mode rendering inside an xterm is
+#   text-only, character-cell-perfect, and works everywhere.
+
+$_video = "none"
+$_term_color = (off)
+$_external_char_set = "utf8"
+
+$_com1 = "pts /tmp/dos-com1"
+
+$_cpu_vm = "emulated"
+$_cpu_vm_dpmi = "emulated"
+$_cpuemu = (1)
+
+$_lpt1 = ""
+$_lpt2 = ""
+$_sound = (off)
+$_joystick = ""
+$_mouse_internal = (off)
+$_layout = "us"
