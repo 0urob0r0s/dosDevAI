@@ -1,0 +1,82 @@
+# ── Bind-mount targets (per docker-compose.yml) ───────────────────────
+# These directories are bind-mounted INTO the container at runtime and
+# accumulate per-project DOS state, agent memory, and Claude Code
+# session data. Never commit them — they're host-machine-specific and
+# typically large.
+dos-c/
+.claude/
+workspace/
+
+# `workspace/` only matters if a project nests another /workspace bind
+# inside this template's repo. Top-level /workspace IS the repo root
+# (this file lives there), so don't ignore it here. If you stand up a
+# project that bind-mounts a different ./workspace, add this line at
+# the project's repo root instead:
+#   /workspace/
+
+# ── Open Watcom build artifacts ──────────────────────────────────────
+# Per-project build output dirs.
+examples/*/build/
+**/build/
+*.obj
+*.OBJ
+*.o
+*.err
+*.ERR
+*.map
+*.MAP
+*.lst
+*.LST
+
+# Don't ignore tracked .EXE/.COM in examples (they may be reference
+# binaries the project ships); only the build/ dir above.
+
+# ── DOS test artifacts (SerialDFS-style projects) ────────────────────
+# Per-namemap caches written by the test harness.
+.serialdfs-namemap.json
+
+# ── Runtime files written into bind mounts ───────────────────────────
+# 86Box per-project state.
+*.nvr
+*.tmp
+86box.log
+*.cfg.bak
+
+# Floppy / image artifacts produced per-test.
+AGENT.IMG
+agent.img
+*.img.bak
+
+# Daemon logs spilling out of /tmp into project dirs by accident.
+*.log
+*.log.[0-9]*
+
+# Allow logs that are deliberately tracked (e.g. example expected output).
+!examples/**/*.log
+
+# ── Editor / OS metadata ─────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+*.code-workspace
+
+# ── Python tool caches (linux-side daemons in DOS projects) ──────────
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.mypy_cache/
+*.egg-info/
+.venv/
+venv/
+
+# ── Node tool caches (Claude Code lives in $HOME, not here) ──────────
+node_modules/
+
+# ── XTGOLD / DOS app working data ────────────────────────────────────
+DOS/.serialdfs-namemap.json
+DOS/HELLO.OUT

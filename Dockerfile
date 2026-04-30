@@ -17,6 +17,21 @@ ENV TZ=Etc/UTC
 # --------------------------------------------------------------------
 # System packages.
 # --------------------------------------------------------------------
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+        ca-certificates \
+        curl \
+        gnupg \
+        software-properties-common; \
+    install -d -m 0755 /etc/apt/keyrings; \
+    curl -fsSL "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x6D9CD73B401A130336ED0A56EBE1B5DED2AD45D6" \
+        | gpg --dearmor -o /etc/apt/keyrings/dosemu2-ppa.gpg; \
+    chmod 0644 /etc/apt/keyrings/dosemu2-ppa.gpg; \
+    echo "deb [signed-by=/etc/apt/keyrings/dosemu2-ppa.gpg] https://ppa.launchpadcontent.net/dosemu2/ppa/ubuntu noble main" \
+        > /etc/apt/sources.list.d/dosemu2-ppa.list; \
+    apt-get update;
+
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
         curl \
